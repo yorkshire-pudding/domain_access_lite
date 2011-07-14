@@ -1,0 +1,29 @@
+<?php
+
+/**
+ * @file
+ * The install and update code for the domain_access_lite module.
+ */
+
+/**
+ * Implementation of hook_install().
+ */
+function domain_access_lite_install() {
+  db_query("INSERT INTO `vocabulary` (name, description, help, relations, hierarchy, multiple, required, tags, module, weight) VALUES ('Domains', '', 'Domains on which access will be granted to this node. If left blank, access will be granted on all domains.', 1, 0, 1, 0, 0, 'domain_access_lite', 0);");
+  $vid = db_last_insert_id('vocabulary', 'vid');
+
+  variable_set('domain_access_lite_vid', $vid);
+}
+
+/**
+ * Implementation of hook_uninstall().
+ */
+function domain_access_lite_uninstall() {
+  if ($vid = variable_get('domain_access_lite_vid', 0)) {
+    taxonomy_del_vocabulary($vid);
+  }
+  db_query("DELETE FROM {variable} WHERE name LIKE 'domain_access_lite_%'");
+
+  // Notify that node access needs to be rebuilt.
+  node_access_needs_rebuild(TRUE);
+}

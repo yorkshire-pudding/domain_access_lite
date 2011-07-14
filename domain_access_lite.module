@@ -1,0 +1,304 @@
+<?php
+
+/**
+ * @file
+ * Domain Access (Lightweight) module.
+ *
+ * A lightweight module that provides tools for restricting content access over
+ * a group of affiliated sites based on domain from one Drupal installation and
+ * a single shared database.
+ */
+
+/**
+ * Define the custom_url_rewrite_outbound() function if not already defined.
+ */
+if (!function_exists('custom_url_rewrite_outbound')) {
+  function custom_url_rewrite_outbound(&$path, &$options, $original_path) {
+    domain_access_lite_url_outbound_alter($path, $options, $original_path);
+  }
+}
+
+/**
+ * Implementation of hook_url_outbound_alter().
+ */
+function domain_access_lite_url_outbound_alter(&$path, &$options, $original_path) {
+  if ($options['absolute'] && $domain = $options['domain']) {
+    if ($base = variable_get('domain_access_lite_domain_' . strtolower($domain->name), '')) {
+      $protocol = 'http://';
+      $options['base_url'] = $protocol . $base;
+    }
+  }
+}
+
+/**
+ * Implementation of hook_init().
+ */
+function domain_access_lite_init() {
+  if (module_exists('context')) {
+    if ($plugin = context_get_plugin('condition', 'domain_access_lite_domain')) {
+      $domain = domain_access_lite_current();
+      if (!empty($domain->name)) {
+        $plugin->execute($domain->name);
+      }
+    }
+  }
+}
+
+/**
+ * Implementation of hook_menu().
+ */
+function domain_access_lite_menu() {
+  $items = array();
+  $items['admin/settings/domain_access_lite'] = array(
+    'title' => 'Domain access',
+    'description' => 'A listing of domains.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('domain_access_lite_admin'),
+    'access arguments' => array('administer domain_access_lite'),
+    'file' => 'domain_access_lite.admin.inc',
+  );
+  return $items;
+}
+
+/**
+ * Implementation of hook_nodeapi().
+ */
+function domain_access_lite_nodeapi(&$node, $op, $a3 = NULL, $a4 = NULL) {
+  switch ($op) {
+    case 'prepare':
+    case 'load':
+      // Cannot load if the node has not been created yet.
+      if (!isset($node->nid)) {
+        return;
+      }
+      $node->domains = domain_access_lite_get_node_domains($node);
+      break;
+  }
+}
+
+/**
+ * Implementation of hook_taxonomy().
+ */
+function domain_access_lite_taxonomy($op, $type, $array = NULL) {
+  if ($type == 'vocabulary' && $op == 'delete') {
+    if (variable_get('domain_access_lite_vid', NULL) == $array['vid']) {
+      variable_set('domain_access_lite_vid', NULL);
+
+      // Notify that node access needs to be rebuilt.
+      node_access_needs_rebuild(TRUE);
+    }
+  }
+}
+
+/**
+ * Implements hook_node_grants().
+ */
+function domain_access_lite_node_grants($account, $op) {
+  $grants = array();
+
+  if ($op == 'view') {
+    // Grant based on active domain.
+    $domain = domain_access_lite_get_domain();
+    if ($domain) {
+      $grants['domain_access_lite'][] = $domain->tid;
+    }
+    $grants['domain_access_lite'][] = 0;
+  }
+  return $grants;
+}
+
+/**
+ * Implementation of hook_node_access_records()
+ */
+function domain_access_lite_node_access_records($node) {
+  if (!($vid = variable_get('domain_access_lite_vid', NULL))) {
+    return array();
+  }
+
+  $grants = array();
+  if (!isset($node->domains)) {
+    $node->domains = domain_access_lite_get_node_domains($node);
+  }
+
+  // Set the domain-specific grants.
+  if (!empty($node->domains)) {
+    foreach ($node->domains as $key => $value) {
+      $grants[] = array(
+        'realm' => 'domain_access_lite',
+        'gid' => $key,
+        'grant_view' => TRUE,
+        'grant_update' => TRUE,
+        'grant_delete' => TRUE,
+        'priority' => 0,
+      );
+    }
+  }
+  // At least one option must be present, and it is the default site
+  else {
+    $grants[] = array(
+    'realm' => 'domain_access_lite',
+    'gid' => 0,
+    'grant_view' => TRUE,
+    'grant_update' => TRUE,
+    'grant_delete' => TRUE,
+    'priority' => 0,
+    );
+  }
+
+  return $grants;
+}
+
+/**
+ * Implementation of hook_db_rewrite_sql().
+ */
+function domain_access_lite_db_rewrite_sql($query, $primary_table, $primary_field, $args) {
+  // restrict for admin as well
+  if (arg(0) != 'admin') {
+    if ($primary_field == 'nid' && ($vid = variable_get('domain_access_lite_vid', NULL)) && user_access('administer nodes')) {
+      if ($domain = domain_access_lite_get_domain()) {
+        return array(
+          'join' => "INNER JOIN {node_access} domain_access_lite_node_access ON ($primary_table.nid = domain_access_lite_node_access.nid)",
+          'where' => "(domain_access_lite_node_access.realm = 'domain_access_lite' AND (domain_access_lite_node_access.gid = 0 OR domain_access_lite_node_access.gid = $domain->tid))",
+        );
+      }
+    }
+  }
+}
+
+/**
+ * Implementation of hook_apachesolr_modify_query().
+ */
+function domain_access_lite_apachesolr_modify_query($query, &$params, $caller) {
+  $domain = domain_access_lite_get_domain();
+  if ($domain) {
+    $query->add_filter('tid', $domain->tid);
+  }
+}
+
+/**
+ * Implementation of hook_form_alter().
+ * Set the taxonomy vocabulary to the current domain.
+ */
+function domain_access_lite_form_alter(&$form, &$form_state, $form_id) {
+  if (isset($form['#node']) && $form['#node']->type .'_node_form' == $form_id) {
+    if (($domain = domain_access_lite_current()) && isset($form['taxonomy'][$domain->vid])) {
+      if (empty($form['taxonomy'][$domain->vid]['#default_value'])) {
+        if ($form['taxonomy'][$domain->vid]['#multiple']) {
+          $form['taxonomy'][$domain->vid]['#default_value'] = array($domain->tid);
+        }
+        else {
+          $form['taxonomy'][$domain->vid]['#default_value'] = $domain->tid;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implementation of hook_context_plugins().
+ */
+function domain_access_lite_context_plugins() {
+  $plugins = array();
+  $plugins['domain_access_lite_domain_context_condition'] = array(
+    'handler' => array(
+      'path' => drupal_get_path('module', 'domain_access_lite') . '/plugins',
+      'file' => 'domain_access_lite_context_condition.inc',
+      'class' => 'domain_access_lite_domain_context_condition',
+      'parent' => 'context_condition',
+    ),
+  );
+  return $plugins;
+}
+
+/**
+ * Implementation of hook_context_registry().
+ */
+function domain_access_lite_context_registry() {
+  return array(
+    'conditions' => array(
+      'domain_access_lite_domain' => array(
+        'title' => t('Domain'),
+        'description' => t('Set context based on the current domain.'),
+        'plugin' => 'domain_access_lite_domain_context_condition',
+      ),
+    ),
+  );
+}
+
+/**
+ * Retrieve the domain object for the current domain or the domain specified in
+ * the $domain parameter.
+ *
+ * @param $domain
+ *   String (optional). The domain for which you would like to return the
+ *   domain object.
+ *
+ * @return
+ *   A domain object.
+ */
+function domain_access_lite_get_domain($domain = NULL) {
+  $domains = domain_access_lite_get_domains();
+  if ($domain && isset($domains[$domain])) {
+    return $domains[$domain];
+  }
+  elseif (!empty($_SERVER['HTTP_HOST'])) {
+    $domain = strtolower(rtrim($_SERVER['HTTP_HOST']));
+    return isset($domains[$domain]) ? $domains[$domain] : NULL;
+  }
+  else {
+    return NULL;
+  }
+}
+
+/**
+ * Retrieve an array of all domain objects for a given node.
+ *
+ * @param $node
+ *   The node.
+ * @return
+ *   An array of domain objects.
+ */
+function domain_access_lite_get_node_domains($node) {
+  $domains = array();
+  if ($vid = variable_get('domain_access_lite_vid', NULL)) {
+    $terms = taxonomy_node_get_terms_by_vocabulary($node, $vid);
+    foreach ($terms as $term) {
+      if ($domain = variable_get('domain_access_lite_domain_' . strtolower($term->name), '')) {
+        $domains[$term->tid] = $domain;
+      }
+    }
+  }
+  return $domains;
+}
+
+/**
+ * Retrieve an array of all domain objects.
+ *
+ * @return
+ *   An array of domain objects.
+ */
+function domain_access_lite_get_domains() {
+  static $domains = array();
+  if (empty($domains)) {
+    if ($vid = variable_get('domain_access_lite_vid', NULL)) {
+      $result = db_query(db_rewrite_sql('SELECT t.tid, t.* FROM {term_data} t WHERE t.vid = %d ORDER BY weight', 't', 'tid'), $vid);
+      while ($term = db_fetch_object($result)) {
+        if ($domain = variable_get('domain_access_lite_domain_' . strtolower($term->name), '')) {
+          $domains[$domain] = $term;
+        }
+      }
+    }
+  }
+  return $domains;
+}
+
+/**
+ * Retrieve the domain object for the current domain.
+ *
+ * @return
+ *   A domain object.
+ */
+function domain_access_lite_current() {
+  $domains = domain_access_lite_get_domains();
+  return isset($domains[$_SERVER['HTTP_HOST']]) ? $domains[$_SERVER['HTTP_HOST']] : array_slice($domains, 0, 1);
+}

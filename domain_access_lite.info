@@ -1,0 +1,4 @@
+name = Domain Access (Lightweight)
+description = A lightweight domain-based access control system.
+
+core = 6.x
